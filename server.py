@@ -10,7 +10,7 @@ import io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
-from flask import Flask, request
+from flask import Flask, request, jsonify, abort
 from pypresence import Presence
 from ytmusicapi import YTMusic
 from difflib import SequenceMatcher
@@ -20,6 +20,9 @@ import time
 import threading
 import atexit
 
+# 本番用サーバー
+from waitress import serve
+
 # ========================================
 #  設定
 # ========================================
@@ -27,10 +30,11 @@ import atexit
 # .envファイルから環境変数を読み込み
 load_dotenv()
 
-# Discord Application ID（環境変数から取得、なければデフォルト値）
+# Discord Application ID
 CLIENT_ID = os.getenv('DISCORD_CLIENT_ID', '1442908216097767424')
 SERVER_HOST = os.getenv('SERVER_HOST', '0.0.0.0')
 SERVER_PORT = int(os.getenv('SERVER_PORT', '5000'))
+AUTH_TOKEN = os.getenv('AUTH_TOKEN') # 設定されていない場合はNone
 
 # ========================================
 #  グローバル変数
@@ -63,6 +67,18 @@ idle_timer = None
 #  ユーティリティ関数
 # ========================================
 
+def check_auth():
+    """認証トークンを確認"""
+    if not AUTH_TOKEN:
+        return True # トークン設定がなければ認証スキップ（警告推奨）
+    
+    auth_header = request.headers.get('Authorization')
+    # "Bearer <token>" 形式または直接トークンを許容
+    if auth_header and (auth_header == AUTH_TOKEN or auth_header == f"Bearer {AUTH_TOKEN}"):
+        return True
+    
+    return False
+
 def similar(a: str, b: str) -> float:
     """文字列の類似度を判定（0.0〜1.0）"""
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
@@ -82,12 +98,16 @@ def connect_rpc() -> bool:
             if RPC is None:
                 RPC = Presence(CLIENT_ID)
             
+            # 既に接続済みの場合はconnectしない
+            # pypresenceの仕様上、closeせずにconnectはエラーになる場合があるため
+            # ここではシンプルに再接続ロジックとする
             RPC.connect()
             rpc_connected = True
             print("✅ Discordに接続しました！")
             return True
         except Exception as e:
             rpc_connected = False
+            # 頻繁に出るとうるさいので接続失敗ログは控えめに、あるいは初回のみ
             print(f"⚠️ Discord接続失敗: {e}")
             return False
 
@@ -148,6 +168,8 @@ def search_album_art(title: str, artist: str) -> tuple[str, str | None]:
     video_id = None
     
     try:
+        # 検索処理（同期処理なので時間がかかる可能性がある）
+        # 将来的には非同期化が望ましいが、簡易実装のためこのまま
         search_results = yt.search(f"{title} {artist}", filter="songs")
         
         if search_results:
@@ -168,7 +190,11 @@ def search_album_art(title: str, artist: str) -> tuple[str, str | None]:
                     best_match = item
 
             if best_match and highest_score > 0.5:
-                image_url = best_match['thumbnails'][-1]['url']
+                # サムネイル取得
+                thumbnails = best_match.get('thumbnails', [])
+                if thumbnails:
+                    image_url = thumbnails[-1]['url']
+                
                 video_id = best_match.get('videoId')
                 print(f"✅ 画像特定 (信頼度: {highest_score:.2f}): {best_match['title']}")
             else:
@@ -194,6 +220,19 @@ def search_album_art(title: str, artist: str) -> tuple[str, str | None]:
 last_update_time = 0
 last_calc_start_time = 0
 
+@app.before_request
+def before_request():
+    """リクエストごとの前処理（認証チェック）"""
+    # health checkは認証不要でも良いが、念のためすべてに適用するか、
+    # 公開しないなら全部にかける。今回は全てにかける。
+    if request.endpoint == 'health_check':
+        return # health checkは除外（死活監視のため）
+    
+    if not check_auth():
+        print(f"⛔ 認証失敗: {request.remote_addr}")
+        return jsonify({"error": "Unauthorized"}), 401
+
+
 @app.route('/update', methods=['POST'])
 def update_status():
     """再生情報を受け取りDiscord Presenceを更新"""
@@ -201,15 +240,24 @@ def update_status():
     
     try:
         data = request.json
-        title = data.get('title', '')
-        artist = data.get('artist', '')
-        is_playing = data.get('is_playing', True)
-        duration = data.get('duration', 0)
-        position = data.get('position', 0)
+        if not data:
+            return jsonify({"error": "Invalid JSON"}), 400
+
+        # バリデーションと型変換
+        title = str(data.get('title', 'Unknown Title'))
+        artist = str(data.get('artist', 'Unknown Artist'))
+        is_playing = bool(data.get('is_playing', True))
+        
+        try:
+            duration = float(data.get('duration', 0))
+            position = float(data.get('position', 0))
+        except (ValueError, TypeError):
+            duration = 0
+            position = 0
         
         print(f"📩 受信: {title} - {artist} (Pos: {position}s)")
         
-        # 一時停止中ならPresenceをクリア...せずに「Paused」表示にする
+        # 一時停止中なら「Paused」表示にする
         small_image = "youtube_music_icon"
         small_text = "Playing on Android"
         
@@ -218,9 +266,9 @@ def update_status():
             small_image = "https://img.icons8.com/ios-glyphs/60/ffffff/pause--v1.png"
             small_text = "⏸️ Paused"
         
-        # 空文字チェック
-        if not title: title = "Unknown Title"
-        if not artist: artist = "Unknown Artist"
+        # 空文字チェックと最小長確保
+        if not title.strip(): title = "Unknown Title"
+        if not artist.strip(): artist = "Unknown Artist"
         if len(title) < 2: title += " "
         if len(artist) < 2: artist += " "
 
@@ -233,6 +281,7 @@ def update_status():
         is_seeked = time_diff > 2 # 2秒以上のズレ
         
         # 同じ曲 かつ 状態変化なし かつ シークもしていない ならスキップ
+        # ただし、再生位置が大きくずれていないかの確認なども含める
         if (title == last_title and 
             artist == last_artist and 
             is_playing == last_is_playing and 
@@ -271,7 +320,7 @@ def update_status():
         if video_id:
             buttons = [
                 {
-                    "label": "🎵 YouTube Musicで聴く",
+                    "label": "🎵 Listen on YouTube Music",
                     "url": f"https://music.youtube.com/watch?v={video_id}"
                 }
             ]
@@ -284,8 +333,8 @@ def update_status():
                     'state': artist,
                     'large_image': image_url,
                     'large_text': "YouTube Music",
-                    'small_image': small_image, # 変数を使用
-                    'small_text': small_text    # 変数を使用
+                    'small_image': small_image,
+                    'small_text': small_text
                 }
                 
                 if timestamps:
@@ -297,8 +346,6 @@ def update_status():
                 
                 result = RPC.update(**update_args)
                 print(f"🎵 Presence更新: {title} - {artist}", flush=True)
-                print(f"   -> RPC結果: {result}", flush=True)
-                print(f"   -> 引数: {update_args}", flush=True)
                 
             except Exception as rpc_error:
                 global rpc_connected
@@ -313,7 +360,7 @@ def update_status():
         
     except Exception as e:
         print(f"❌ エラー: {e}")
-        return "Error", 500
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/pause', methods=['POST'])
@@ -326,11 +373,12 @@ def pause_status():
 @app.route('/health', methods=['GET'])
 def health_check():
     """ヘルスチェック用エンドポイント"""
-    return {
+    return jsonify({
         "status": "running",
         "discord_connected": rpc_connected,
-        "cache_size": len(image_cache)
-    }, 200
+        "cache_size": len(image_cache),
+        "auth_enabled": bool(AUTH_TOKEN)
+    }), 200
 
 
 # ========================================
@@ -366,6 +414,13 @@ if __name__ == '__main__':
     print("=" * 50)
     print("🎵 YouTube Music Discord Presence Server")
     print("=" * 50)
+    
+    if not AUTH_TOKEN:
+        print("⚠️  警告: AUTH_TOKENが設定されていません。.envファイルの設定を推奨します。")
+        print("    認証なしで誰でもリクエストを送信できる状態です。")
+    else:
+        print("🔒 認証: 有効 (Token設定済み)")
+    
     print(f"📡 サーバー: http://{SERVER_HOST}:{SERVER_PORT}")
     print(f"🔑 Client ID: {CLIENT_ID[:8]}...")
     print("=" * 50)
@@ -373,5 +428,10 @@ if __name__ == '__main__':
     # 初回接続
     connect_rpc()
     
-    # サーバー起動
-    app.run(host=SERVER_HOST, port=SERVER_PORT, debug=False)
+    # Waitressサーバー起動
+    print(f"🚀 サーバー稼働中... (Press CTRL+C to quit)")
+    try:
+        serve(app, host=SERVER_HOST, port=SERVER_PORT)
+    except OSError as e:
+        print(f"❌ 起動エラー: {e}")
+        print("ポートが既に使用されている可能性があります。")

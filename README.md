@@ -41,24 +41,24 @@ pip install -r requirements.txt
 # .env.exampleをコピー
 cp .env.example .env
 
-# .envを編集してDiscord Application IDを設定
+# .envを編集して設定を変更
+# - DISCORD_CLIENT_ID: そのまま
+# - AUTH_TOKEN: 安全なパスワードに変更してください（任意ですが推奨）
 ```
 
-**Discord Application IDの取得方法:**
-1. [Discord Developer Portal](https://discord.com/developers/applications)にアクセス
-2. 「New Application」でアプリを作成
-3. 「Application ID」をコピー
+**Recommended:** セキュリティのため `AUTH_TOKEN` を設定することを強く推奨します。
 
 ### 4. サーバーを起動
 
 ```bash
 python server.py
+# Production server (waitress) on http://0.0.0.0:5000
 ```
 
 ## 📡 APIエンドポイント
 
 ### POST `/update`
-曲情報を更新します。
+曲情報を更新します。ヘッダーに `Authorization: Bearer <AUTH_TOKEN>` が必要です（トークン設定時）。
 
 **リクエストボディ:**
 ```json
@@ -71,54 +71,23 @@ python server.py
 }
 ```
 
-| フィールド | 型 | 説明 |
-|----------|------|------|
-| title | string | 曲名（必須） |
-| artist | string | アーティスト名（必須） |
-| is_playing | boolean | 再生中かどうか（オプション、デフォルト: true） |
-| duration | number | 曲の長さ（秒）（オプション） |
-| position | number | 現在の再生位置（秒）（オプション） |
-
-### POST `/pause`
-Presenceをクリアします。
-
-### GET `/health`
-サーバーの状態を確認します。
-
-**レスポンス:**
-```json
-{
-  "status": "running",
-  "discord_connected": true,
-  "cache_size": 10
-}
-```
-
 ## 📱 Androidクライアントの設定
 
-### 1. Android Studioを開く
-同梱の `AndroidStudio` フォルダをAndroid Studioで開きます。
+### 1. Android Studioでビルド
+同梱の `AndroidStudio` フォルダを開き、アプリをビルドして端末にインストールします。
 
-### 2. IPアドレスの設定
-`app/src/main/java/com/example/youtubemusicrpc/MyNotificationListener.kt` を開き、`SERVER_URL` をあなたのPCのIPアドレスに変更してください。
+### 2. アプリ設定
+アプリを起動すると設定画面が表示されます。以下の情報を入力して「Save Settings」を押してください。
 
-```kotlin
-// Before
-private val SERVER_URL = "http://100.125.20.126:5000/update"
+- **PC IP Address**: サーバーを起動しているPCのIPアドレス（例: `192.168.1.10`）
+- **Port**: `5000`（変更していなければそのまま）
+- **Auth Token**: `.env` ファイルで設定したトークン（設定していなければ空欄）
 
-// After (例: PCのIPが 192.168.1.10 の場合)
-private val SERVER_URL = "http://192.168.1.10:5000/update"
-```
+### 3. 権限の許可
+「Open Notification Settings」ボタンをタップし、「通知へのアクセス」をこのアプリに許可してください。
 
-### 3. ビルドとインストール
-アプリをビルドし、Android端末にインストールします。
-
-### 4. 権限の許可
-1. アプリを起動し、画面上のボタンをタップします。
-2. 「通知へのアクセス」設定画面が開くので、このアプリ（YouTube Music RPC Listener）をONにします。
-
-### 5. YouTube Musicで再生
-YouTube Musicアプリで音楽を再生すると、自動的にDiscord Rich Presenceが更新されます。
+### 4. YouTube Musicで再生
+設定完了後、YouTube Musicで音楽を再生するとPC側のDiscord Rich Presenceが更新されます。
 
 ---
 
@@ -130,15 +99,17 @@ YouTube Musicアプリで音楽を再生すると、自動的にDiscord Rich Pre
 2. タスク: HTTP Request
    - Method: POST
    - URL: `http://YOUR_PC_IP:5000/update`
+   - Headers: `Authorization: Bearer YOUR_TOKEN` (トークン設定時)
    - Body: `{"title": "%MTRACK", "artist": "%MARTIST"}`
 
 ## ⚙️ 環境変数
 
 | 変数名 | 説明 | デフォルト |
 |--------|------|----------|
-| DISCORD_CLIENT_ID | Discord Application ID | - |
+| DISCORD_CLIENT_ID | Discord Application ID | (Default ID) |
 | SERVER_HOST | サーバーホスト | 0.0.0.0 |
 | SERVER_PORT | サーバーポート | 5000 |
+| AUTH_TOKEN | API認証トークン（推奨） | None |
 
 ## 📝 ライセンス
 
