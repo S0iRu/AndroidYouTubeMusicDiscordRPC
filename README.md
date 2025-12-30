@@ -11,7 +11,7 @@ AndroidのYouTube Musicで再生中の曲をDiscordに表示するサーバー�
 - ⏱️ **再生時間表示** - 曲の進行状況を表示（対応クライアント必要）
 - 🔗 **YouTube Musicリンク** - ワンクリックで曲を開けるボタン
 - 🔄 **自動再接続** - Discordとの接続が切れても自動復帰
-- ⏸️ **一時停止検出** - 停止中はPresenceを自動クリア
+- ⏸️ **一時停止検出** - 停止中は「Paused」ステータスを表示
 - 📦 **画像キャッシュ** - 同じ曲の再検索を防止
 
 ## 📋 必要なもの
@@ -25,8 +25,8 @@ AndroidのYouTube Musicで再生中の曲をDiscordに表示するサーバー�
 ### 1. リポジトリをクローン
 
 ```bash
-git clone https://github.com/yourusername/AndroidYouTubeMusicDiscordPRC.git
-cd AndroidYouTubeMusicDiscordPRC
+git clone https://github.com/yourusername/AndroidYouTubeMusicDiscordRPC.git
+cd AndroidYouTubeMusicDiscordRPC
 ```
 
 ### 2. 依存関係をインストール
@@ -96,9 +96,36 @@ Presenceをクリアします。
 
 ## 📱 Androidクライアントの設定
 
-Tasker等を使って、YouTube Musicの再生情報をこのサーバーに送信してください。
+### 1. Android Studioを開く
+同梱の `AndroidStudio` フォルダをAndroid Studioで開きます。
 
-**Taskerの設定例:**
+### 2. IPアドレスの設定
+`app/src/main/java/com/example/youtubemusicrpc/MyNotificationListener.kt` を開き、`SERVER_URL` をあなたのPCのIPアドレスに変更してください。
+
+```kotlin
+// Before
+private val SERVER_URL = "http://100.125.20.126:5000/update"
+
+// After (例: PCのIPが 192.168.1.10 の場合)
+private val SERVER_URL = "http://192.168.1.10:5000/update"
+```
+
+### 3. ビルドとインストール
+アプリをビルドし、Android端末にインストールします。
+
+### 4. 権限の許可
+1. アプリを起動し、画面上のボタンをタップします。
+2. 「通知へのアクセス」設定画面が開くので、このアプリ（YouTube Music RPC Listener）をONにします。
+
+### 5. YouTube Musicで再生
+YouTube Musicアプリで音楽を再生すると、自動的にDiscord Rich Presenceが更新されます。
+
+---
+
+### (代替手段) Taskerなどの自動化アプリを使用する場合
+自作アプリを使用せず、TaskerなどのHTTPリクエスト送信機能を持つアプリを使用することも可能です。
+
+**設定例:**
 1. プロファイル: アプリ = YouTube Music
 2. タスク: HTTP Request
    - Method: POST
