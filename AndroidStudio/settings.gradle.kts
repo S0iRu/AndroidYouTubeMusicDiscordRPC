@@ -19,5 +19,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "YoutubeMusicRPC"
+rootProject.name = "AndroidYouTubeMusicDiscordRPC"
 include(":app")
