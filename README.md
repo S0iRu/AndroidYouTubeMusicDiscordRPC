@@ -117,6 +117,8 @@ python server.py
 }
 ```
 
+<!--
 ## 📝 ライセンス
 
 MIT License
+-->
