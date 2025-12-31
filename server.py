@@ -1,16 +1,23 @@
 """
 Android YouTube Music Discord Rich Presence Server
 YouTubeMusicの再生情報をDiscordに表示するサーバー
+
+外部公開対応版 - セキュリティ強化済み
 """
 
 import sys
 import io
+import re
+import secrets
 
 # Windows文字コード問題対策（UTF-8強制）
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
-from flask import Flask, request, jsonify, abort
+from flask import Flask, request, jsonify, g
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_cors import CORS
 from pypresence import Presence
 from ytmusicapi import YTMusic
 from difflib import SequenceMatcher
@@ -19,6 +26,8 @@ import os
 import time
 import threading
 import atexit
+import hashlib
+import hmac
 
 # 本番用サーバー
 from waitress import serve
@@ -34,13 +43,49 @@ load_dotenv()
 CLIENT_ID = os.getenv('DISCORD_CLIENT_ID', '1442908216097767424')
 SERVER_HOST = os.getenv('SERVER_HOST', '0.0.0.0')
 SERVER_PORT = int(os.getenv('SERVER_PORT', '5000'))
-AUTH_TOKEN = os.getenv('AUTH_TOKEN') # 設定されていない場合はNone
+AUTH_TOKEN = os.getenv('AUTH_TOKEN')  # 設定されていない場合はNone
+
+# セキュリティ設定
+ALLOWED_IPS = os.getenv('ALLOWED_IPS', '')  # カンマ区切りで許可IP指定 (空なら全許可)
+RATE_LIMIT_UPDATE = os.getenv('RATE_LIMIT_UPDATE', '60/minute')  # /update のレート制限
+RATE_LIMIT_DEFAULT = os.getenv('RATE_LIMIT_DEFAULT', '120/minute')  # デフォルトのレート制限
+MAX_CONTENT_LENGTH = 10 * 1024  # 10KB（リクエストボディの最大サイズ）
+
+# リバースプロキシ設定（X-Forwarded-Forを信頼するか）
+# Nginx等のリバースプロキシ経由でアクセスする場合のみtrueに設定
+TRUST_PROXY = os.getenv('TRUST_PROXY', 'false').lower() == 'true'
+
+# 許可IPリストをパース
+ALLOWED_IP_LIST = [ip.strip() for ip in ALLOWED_IPS.split(',') if ip.strip()]
+
+# ========================================
+#  Flaskアプリ初期化
+# ========================================
+
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
+
+# CORS設定（必要に応じてoriginsを制限）
+CORS(app, resources={
+    r"/*": {
+        "origins": "*",  # 本番環境では特定のオリジンに制限推奨
+        "methods": ["GET", "POST"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
+})
+
+# レート制限設定
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    default_limits=[RATE_LIMIT_DEFAULT],
+    storage_uri="memory://",
+    strategy="fixed-window"
+)
 
 # ========================================
 #  グローバル変数
 # ========================================
-
-app = Flask(__name__)
 
 # Discord RPC関連
 RPC = None
@@ -53,31 +98,117 @@ yt = YTMusic()
 # 状態保存用
 last_title = ""
 last_artist = ""
-last_is_playing = True # 初期値
-# 画像キャッシュ（同じ曲を何度も検索しないため）
-# 形式: {"曲名 - アーティスト": "画像URL"}
+last_is_playing = True
+# 画像キャッシュ
 image_cache = {}
-CACHE_MAX_SIZE = 100  # キャッシュの最大数
+CACHE_MAX_SIZE = 100
 
-# 自動クリア用（一定時間更新がなければPresenceを消す）
-IDLE_TIMEOUT = 180  # 3分間更新がなければクリア
+# 自動クリア用
+IDLE_TIMEOUT = 180
 idle_timer = None
+
+# 認証失敗ログ用（ブルートフォース対策）
+auth_failures = {}
+AUTH_FAILURE_THRESHOLD = 10  # 10回失敗でブロック
+AUTH_FAILURE_WINDOW = 300    # 5分間
+MAX_AUTH_FAILURE_ENTRIES = 1000  # メモリ保護: 最大追跡IP数
+
+# ========================================
+#  セキュリティ関数
+# ========================================
+
+def get_client_ip():
+    """クライアントIPを取得（プロキシ対応）"""
+    # TRUST_PROXYが有効な場合のみX-Forwarded-Forを信頼
+    # 直接接続時にこれを信頼すると、攻撃者がIPを偽装できる
+    if TRUST_PROXY and request.headers.get('X-Forwarded-For'):
+        # 最初のIPが元のクライアント
+        return request.headers.get('X-Forwarded-For').split(',')[0].strip()
+    return request.remote_addr or '0.0.0.0'
+
+
+def is_ip_allowed(ip: str) -> bool:
+    """IPアドレスが許可リストにあるか確認"""
+    if not ALLOWED_IP_LIST:
+        return True  # 許可リストが空なら全許可
+    
+    # CIDR表記やワイルドカードにも対応可能だが、簡易実装として完全一致のみ
+    return ip in ALLOWED_IP_LIST
+
+
+def is_ip_blocked(ip: str) -> bool:
+    """IPがブルートフォース対策でブロックされているか"""
+    if ip not in auth_failures:
+        return False
+    
+    failures = auth_failures[ip]
+    current_time = time.time()
+    
+    # ウィンドウ外の古い失敗を削除
+    failures = [t for t in failures if current_time - t < AUTH_FAILURE_WINDOW]
+    auth_failures[ip] = failures
+    
+    return len(failures) >= AUTH_FAILURE_THRESHOLD
+
+
+def record_auth_failure(ip: str):
+    """認証失敗を記録（メモリ制限付き）"""
+    if ip not in auth_failures:
+        # メモリ保護: エントリ数が上限に達したら最も古いものを削除
+        if len(auth_failures) >= MAX_AUTH_FAILURE_ENTRIES:
+            # 最も古い失敗記録を持つIPを削除
+            oldest_ip = min(auth_failures.keys(), key=lambda k: min(auth_failures[k]) if auth_failures[k] else float('inf'))
+            del auth_failures[oldest_ip]
+        auth_failures[ip] = []
+    auth_failures[ip].append(time.time())
+
+
+def check_auth() -> bool:
+    """認証トークンを確認（タイミング攻撃対策付き）"""
+    if not AUTH_TOKEN:
+        return True  # トークン設定がなければ認証スキップ
+    
+    auth_header = request.headers.get('Authorization', '')
+    
+    # Bearer プレフィックスを除去
+    token = auth_header
+    if auth_header.startswith('Bearer '):
+        token = auth_header[7:]
+    
+    # タイミング攻撃対策: 固定時間比較
+    return hmac.compare_digest(token, AUTH_TOKEN)
+
+
+def sanitize_string(s: str, max_length: int = 200) -> str:
+    """文字列をサニタイズ（長さ制限、危険な文字除去）"""
+    if not isinstance(s, str):
+        s = str(s)
+    
+    # 長さ制限
+    s = s[:max_length]
+    
+    # 制御文字を除去（改行・タブは許容）
+    s = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', s)
+    
+    return s.strip()
+
+
+def validate_number(value, default: float = 0, min_val: float = 0, max_val: float = float('inf')) -> float:
+    """数値をバリデーション"""
+    try:
+        num = float(value)
+        if num < min_val:
+            return min_val
+        if num > max_val:
+            return max_val
+        return num
+    except (ValueError, TypeError):
+        return default
+
 
 # ========================================
 #  ユーティリティ関数
 # ========================================
-
-def check_auth():
-    """認証トークンを確認"""
-    if not AUTH_TOKEN:
-        return True # トークン設定がなければ認証スキップ（警告推奨）
-    
-    auth_header = request.headers.get('Authorization')
-    # "Bearer <token>" 形式または直接トークンを許容
-    if auth_header and (auth_header == AUTH_TOKEN or auth_header == f"Bearer {AUTH_TOKEN}"):
-        return True
-    
-    return False
 
 def similar(a: str, b: str) -> float:
     """文字列の類似度を判定（0.0〜1.0）"""
@@ -98,16 +229,12 @@ def connect_rpc() -> bool:
             if RPC is None:
                 RPC = Presence(CLIENT_ID)
             
-            # 既に接続済みの場合はconnectしない
-            # pypresenceの仕様上、closeせずにconnectはエラーになる場合があるため
-            # ここではシンプルに再接続ロジックとする
             RPC.connect()
             rpc_connected = True
             print("✅ Discordに接続しました！")
             return True
         except Exception as e:
             rpc_connected = False
-            # 頻繁に出るとうるさいので接続失敗ログは控えめに、あるいは初回のみ
             print(f"⚠️ Discord接続失敗: {e}")
             return False
 
@@ -150,15 +277,11 @@ def reset_idle_timer():
 
 
 def search_album_art(title: str, artist: str) -> tuple[str, str | None]:
-    """
-    曲のアルバムアートを検索
-    Returns: (image_url, video_id)
-    """
+    """曲のアルバムアートを検索"""
     global image_cache
     
     cache_key = get_cache_key(title, artist)
     
-    # キャッシュに存在すればそれを返す
     if cache_key in image_cache:
         cached = image_cache[cache_key]
         print(f"📦 キャッシュヒット: {title}")
@@ -168,8 +291,6 @@ def search_album_art(title: str, artist: str) -> tuple[str, str | None]:
     video_id = None
     
     try:
-        # 検索処理（同期処理なので時間がかかる可能性がある）
-        # 将来的には非同期化が望ましいが、簡易実装のためこのまま
         search_results = yt.search(f"{title} {artist}", filter="songs")
         
         if search_results:
@@ -190,11 +311,9 @@ def search_album_art(title: str, artist: str) -> tuple[str, str | None]:
                     best_match = item
 
             if best_match and highest_score > 0.5:
-                # サムネイル取得
                 thumbnails = best_match.get('thumbnails', [])
                 if thumbnails:
                     image_url = thumbnails[-1]['url']
-                
                 video_id = best_match.get('videoId')
                 print(f"✅ 画像特定 (信頼度: {highest_score:.2f}): {best_match['title']}")
             else:
@@ -203,9 +322,8 @@ def search_album_art(title: str, artist: str) -> tuple[str, str | None]:
     except Exception as search_error:
         print(f"🔍 画像検索失敗: {search_error}")
     
-    # キャッシュに保存（サイズ制限あり）
+    # キャッシュに保存
     if len(image_cache) >= CACHE_MAX_SIZE:
-        # 古いエントリを削除（FIFOで先頭を削除）
         oldest_key = next(iter(image_cache))
         del image_cache[oldest_key]
     
@@ -215,25 +333,103 @@ def search_album_art(title: str, artist: str) -> tuple[str, str | None]:
 
 
 # ========================================
-#  APIエンドポイント
+#  ミドルウェア
 # ========================================
-last_update_time = 0
-last_calc_start_time = 0
 
 @app.before_request
 def before_request():
-    """リクエストごとの前処理（認証チェック）"""
-    # health checkは認証不要でも良いが、念のためすべてに適用するか、
-    # 公開しないなら全部にかける。今回は全てにかける。
-    if request.endpoint == 'health_check':
-        return # health checkは除外（死活監視のため）
+    """リクエストごとの前処理"""
+    client_ip = get_client_ip()
+    g.client_ip = client_ip
     
+    # IP制限チェック
+    if not is_ip_allowed(client_ip):
+        print(f"⛔ IP制限: {client_ip}")
+        return jsonify({"error": "Forbidden"}), 403
+    
+    # ブルートフォース対策
+    if is_ip_blocked(client_ip):
+        print(f"🚫 ブロック中: {client_ip}")
+        return jsonify({"error": "Too many failed attempts"}), 429
+    
+    # health checkは認証不要
+    if request.endpoint == 'health_check':
+        return
+    
+    # 認証チェック
     if not check_auth():
-        print(f"⛔ 認証失敗: {request.remote_addr}")
+        record_auth_failure(client_ip)
+        print(f"⛔ 認証失敗: {client_ip}")
         return jsonify({"error": "Unauthorized"}), 401
 
 
+@app.after_request
+def after_request(response):
+    """レスポンスにセキュリティヘッダーを追加"""
+    # セキュリティヘッダー
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    
+    # サーバー情報を隠す
+    response.headers['Server'] = 'YTM-RPC'
+    
+    return response
+
+
+# ========================================
+#  エラーハンドラ
+# ========================================
+
+@app.errorhandler(400)
+def bad_request(e):
+    return jsonify({"error": "Bad Request"}), 400
+
+
+@app.errorhandler(401)
+def unauthorized(e):
+    return jsonify({"error": "Unauthorized"}), 401
+
+
+@app.errorhandler(403)
+def forbidden(e):
+    return jsonify({"error": "Forbidden"}), 403
+
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"error": "Not Found"}), 404
+
+
+@app.errorhandler(413)
+def request_entity_too_large(e):
+    return jsonify({"error": "Request too large"}), 413
+
+
+@app.errorhandler(429)
+def rate_limit_exceeded(e):
+    return jsonify({"error": "Rate limit exceeded"}), 429
+
+
+@app.errorhandler(500)
+def internal_error(e):
+    # 内部エラーの詳細は隠す
+    return jsonify({"error": "Internal server error"}), 500
+
+
+# ========================================
+#  APIエンドポイント
+# ========================================
+
+last_update_time = 0
+last_calc_start_time = 0
+
+
 @app.route('/update', methods=['POST'])
+@limiter.limit(RATE_LIMIT_UPDATE)
 def update_status():
     """再生情報を受け取りDiscord Presenceを更新"""
     global last_title, last_artist, last_is_playing, last_update_time, last_calc_start_time
@@ -243,21 +439,16 @@ def update_status():
         if not data:
             return jsonify({"error": "Invalid JSON"}), 400
 
-        # バリデーションと型変換
-        title = str(data.get('title', 'Unknown Title'))
-        artist = str(data.get('artist', 'Unknown Artist'))
+        # 入力のバリデーションとサニタイズ
+        title = sanitize_string(data.get('title', 'Unknown Title'), max_length=100)
+        artist = sanitize_string(data.get('artist', 'Unknown Artist'), max_length=100)
         is_playing = bool(data.get('is_playing', True))
-        
-        try:
-            duration = float(data.get('duration', 0))
-            position = float(data.get('position', 0))
-        except (ValueError, TypeError):
-            duration = 0
-            position = 0
+        duration = validate_number(data.get('duration', 0), min_val=0, max_val=86400)  # 最大24時間
+        position = validate_number(data.get('position', 0), min_val=0, max_val=86400)
         
         print(f"📩 受信: {title} - {artist} (Pos: {position}s)")
         
-        # 一時停止中なら「Paused」表示にする
+        # 一時停止中の表示設定
         small_image = "youtube_music_icon"
         small_text = "Playing on Android"
         
@@ -266,22 +457,24 @@ def update_status():
             small_image = "https://img.icons8.com/ios-glyphs/60/ffffff/pause--v1.png"
             small_text = "⏸️ Paused"
         
-        # 空文字チェックと最小長確保
-        if not title.strip(): title = "Unknown Title"
-        if not artist.strip(): artist = "Unknown Artist"
-        if len(title) < 2: title += " "
-        if len(artist) < 2: artist += " "
+        # 空文字チェック
+        if not title.strip():
+            title = "Unknown Title"
+        if not artist.strip():
+            artist = "Unknown Artist"
+        if len(title) < 2:
+            title += " "
+        if len(artist) < 2:
+            artist += " "
 
         # シーク検知ロジック
         current_time = time.time()
-        calc_start_time = current_time - position # 今回の計算上の開始時間
+        calc_start_time = current_time - position
         
-        # 前回計算した開始時間とのズレが2秒以上あれば「シークされた」とみなす
         time_diff = abs(calc_start_time - last_calc_start_time)
-        is_seeked = time_diff > 2 # 2秒以上のズレ
+        is_seeked = time_diff > 2
         
-        # 同じ曲 かつ 状態変化なし かつ シークもしていない ならスキップ
-        # ただし、再生位置が大きくずれていないかの確認なども含める
+        # 重複更新スキップ
         if (title == last_title and 
             artist == last_artist and 
             is_playing == last_is_playing and 
@@ -289,43 +482,38 @@ def update_status():
             current_time - last_update_time < 60):
             
             reset_idle_timer()
-            return "Skipped", 200
+            return jsonify({"status": "skipped"}), 200
 
-        # 更新あり
+        # 状態更新
         last_title = title
         last_artist = artist
         last_is_playing = is_playing
         last_update_time = current_time
-        last_calc_start_time = calc_start_time # 基準時間を更新
+        last_calc_start_time = calc_start_time
 
         # Discord接続確認
         if not ensure_rpc_connection():
-            return "Discord not connected", 503
+            return jsonify({"error": "Discord not connected"}), 503
 
-        # 画像検索（キャッシュ対応）
+        # 画像検索
         image_url, video_id = search_album_art(title, artist)
 
-        # タイムスタンプ計算（再生中のみ表示）
+        # タイムスタンプ計算
         timestamps = {}
         if is_playing and duration > 0:
             start_time = int(current_time - position)
             end_time = int(start_time + duration)
-            timestamps = {
-                'start': start_time,
-                'end': end_time
-            }
+            timestamps = {'start': start_time, 'end': end_time}
 
-        # ボタン設定（YouTube Musicで開くリンク）
+        # ボタン設定
         buttons = None
         if video_id:
-            buttons = [
-                {
-                    "label": "🎵 Listen on YouTube Music",
-                    "url": f"https://music.youtube.com/watch?v={video_id}"
-                }
-            ]
+            buttons = [{
+                "label": "🎵 Listen on YouTube Music",
+                "url": f"https://music.youtube.com/watch?v={video_id}"
+            }]
 
-        # Discordのステータスを更新
+        # Discord Presence更新
         with rpc_lock:
             try:
                 update_args = {
@@ -344,40 +532,41 @@ def update_status():
                 if buttons:
                     update_args['buttons'] = buttons
                 
-                result = RPC.update(**update_args)
-                print(f"🎵 Presence更新: {title} - {artist}", flush=True)
+                RPC.update(**update_args)
+                print(f"🎵 Presence更新: {title} - {artist}")
                 
             except Exception as rpc_error:
                 global rpc_connected
                 rpc_connected = False
                 print(f"⚠️ Presence更新失敗: {rpc_error}")
-                return "RPC Error", 500
+                return jsonify({"error": "RPC error"}), 500
         
-        # アイドルタイマーリセット
         reset_idle_timer()
-        
-        return "OK", 200
+        return jsonify({"status": "ok"}), 200
         
     except Exception as e:
         print(f"❌ エラー: {e}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Internal server error"}), 500
 
 
 @app.route('/pause', methods=['POST'])
+@limiter.limit("30/minute")
 def pause_status():
     """一時停止時にPresenceをクリア"""
     clear_presence()
-    return "Cleared", 200
+    return jsonify({"status": "cleared"}), 200
 
 
 @app.route('/health', methods=['GET'])
+@limiter.limit("10/minute")
 def health_check():
     """ヘルスチェック用エンドポイント"""
     return jsonify({
         "status": "running",
         "discord_connected": rpc_connected,
         "cache_size": len(image_cache),
-        "auth_enabled": bool(AUTH_TOKEN)
+        "auth_enabled": bool(AUTH_TOKEN),
+        "ip_restriction": bool(ALLOWED_IP_LIST)
     }), 200
 
 
@@ -403,6 +592,7 @@ def cleanup():
             except:
                 pass
 
+
 atexit.register(cleanup)
 
 
@@ -411,25 +601,34 @@ atexit.register(cleanup)
 # ========================================
 
 if __name__ == '__main__':
-    print("=" * 50)
+    print("=" * 60)
     print("🎵 YouTube Music Discord Presence Server")
-    print("=" * 50)
+    print("   セキュリティ強化版 (外部公開対応)")
+    print("=" * 60)
     
+    # セキュリティ警告
     if not AUTH_TOKEN:
-        print("⚠️  警告: AUTH_TOKENが設定されていません。.envファイルの設定を推奨します。")
-        print("    認証なしで誰でもリクエストを送信できる状態です。")
+        print("⚠️  警告: AUTH_TOKENが設定されていません！")
+        print("    外部公開時は必ず設定してください: AUTH_TOKEN=<secure-random-token>")
+        print("    トークン生成例: python -c \"import secrets; print(secrets.token_urlsafe(32))\"")
     else:
-        print("🔒 認証: 有効 (Token設定済み)")
+        print("🔒 認証: 有効")
     
+    if ALLOWED_IP_LIST:
+        print(f"🌐 IP制限: 有効 ({len(ALLOWED_IP_LIST)} IPs)")
+    else:
+        print("🌐 IP制限: 無効 (全IP許可)")
+    
+    print(f"⏱️  レート制限: {RATE_LIMIT_UPDATE} (update)")
     print(f"📡 サーバー: http://{SERVER_HOST}:{SERVER_PORT}")
     print(f"🔑 Client ID: {CLIENT_ID[:8]}...")
-    print("=" * 50)
+    print("=" * 60)
     
     # 初回接続
     connect_rpc()
     
     # Waitressサーバー起動
-    print(f"🚀 サーバー稼働中... (Press CTRL+C to quit)")
+    print("🚀 サーバー稼働中... (Press CTRL+C to quit)")
     try:
         serve(app, host=SERVER_HOST, port=SERVER_PORT)
     except OSError as e:

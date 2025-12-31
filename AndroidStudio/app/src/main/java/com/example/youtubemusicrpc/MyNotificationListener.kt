@@ -14,16 +14,34 @@ import okhttp3.Callback
 import okhttp3.Response
 import org.json.JSONObject
 import java.io.IOException
+import java.util.concurrent.TimeUnit
+
+data class ServerSettings(val host: String, val port: String, val token: String, val useHttps: Boolean)
 
 class MyNotificationListener : NotificationListenerService() {
 
-    // 通信クライアント
-    private val client = OkHttpClient()
+    companion object {
+        private const val TAG = "YoutubeMusicRPC"
+        private const val CONNECT_TIMEOUT_SEC = 10L
+        private const val READ_TIMEOUT_SEC = 15L
+        private const val WRITE_TIMEOUT_SEC = 15L
+    }
+
+    // 通信クライアント（タイムアウト設定付き）
+    private val client: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(CONNECT_TIMEOUT_SEC, TimeUnit.SECONDS)
+            .readTimeout(READ_TIMEOUT_SEC, TimeUnit.SECONDS)
+            .writeTimeout(WRITE_TIMEOUT_SEC, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
+            .build()
+    }
+    
     private val JSON_TYPE = "application/json; charset=utf-8".toMediaType()
 
     override fun onListenerConnected() {
         super.onListenerConnected()
-        Log.d("YoutubeMusicRPC", "サービスが接続されました")
+        Log.d(TAG, "サービスが接続されました")
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
@@ -50,7 +68,7 @@ class MyNotificationListener : NotificationListenerService() {
                 }
             }
             
-            Log.d("YoutubeMusicRPC", "🎵 $title - $artist (再生中: $isPlaying)")
+            Log.d(TAG, "🎵 $title - $artist (再生中: $isPlaying)")
 
             // MediaSessionから詳細情報を取得
             var duration = 0L
@@ -77,50 +95,77 @@ class MyNotificationListener : NotificationListenerService() {
 
     override fun onNotificationRemoved(sbn: StatusBarNotification) {
         if (sbn.packageName == "com.google.android.apps.youtube.music") {
-            Log.d("MusicRPC", "再生停止（通知削除）")
+            Log.d(TAG, "再生停止（通知削除）")
             sendPauseToDiscord()
         }
     }
     
-    // 設定を取得するヘルパー関数
-    private fun getSettings(): Triple<String, String, String> {
-        val prefs = getSharedPreferences("rpc_settings", Context.MODE_PRIVATE)
-        val host = prefs.getString("host", "100.125.20.126") ?: "100.125.20.126"
-        val port = prefs.getString("port", "5000") ?: "5000"
-        val token = prefs.getString("token", "") ?: ""
-        return Triple(host, port, token)
+    /**
+     * 設定を取得するヘルパー関数
+     * EncryptedSharedPreferencesから安全に取得
+     */
+    private fun getSettings(): ServerSettings? {
+        return try {
+            val prefs = MainActivity.getEncryptedPrefs(this)
+            val host = prefs.getString("host", "") ?: ""
+            val port = prefs.getString("port", "5000") ?: "5000"
+            val token = prefs.getString("token", "") ?: ""
+            val useHttps = prefs.getBoolean("use_https", false)
+            
+            // ホストが設定されていない場合はnullを返す
+            if (host.isEmpty()) {
+                Log.w(TAG, "⚠️ サーバーホストが設定されていません")
+                return null
+            }
+            
+            ServerSettings(host, port, token, useHttps)
+        } catch (e: Exception) {
+            Log.e(TAG, "設定取得エラー: ${e.message}")
+            null
+        }
     }
     
     private fun sendPauseToDiscord() {
-        val (host, port, token) = getSettings()
-        val url = "http://$host:$port/pause"
+        val settings = getSettings() ?: return
+        val scheme = if (settings.useHttps) "https" else "http"
+        val url = "$scheme://${settings.host}:${settings.port}/pause"
         
         val builder = Request.Builder()
             .url(url)
             .post("".toRequestBody(JSON_TYPE))
             
-        if (token.isNotEmpty()) {
-            builder.addHeader("Authorization", "Bearer $token")
+        if (settings.token.isNotEmpty()) {
+            builder.addHeader("Authorization", "Bearer ${settings.token}")
         }
         
         val request = builder.build()
 
         client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {}
-            override fun onResponse(call: Call, response: Response) { response.close() }
+            override fun onFailure(call: Call, e: IOException) {
+                Log.e(TAG, "❌ Pause送信失敗: ${e.message}")
+            }
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+                    if (!it.isSuccessful) {
+                        Log.w(TAG, "⚠️ Pauseレスポンス: ${it.code}")
+                    }
+                }
+            }
         })
     }
 
     private fun sendToDiscord(title: String, artist: String, isPlaying: Boolean, duration: Long, position: Long) {
-        val (host, port, token) = getSettings()
-        val url = "http://$host:$port/update"
+        val settings = getSettings() ?: return
+        val scheme = if (settings.useHttps) "https" else "http"
+        val url = "$scheme://${settings.host}:${settings.port}/update"
 
-        val jsonBody = JSONObject()
-        jsonBody.put("title", title)
-        jsonBody.put("artist", artist)
-        jsonBody.put("is_playing", isPlaying)
-        jsonBody.put("duration", duration / 1000)
-        jsonBody.put("position", position / 1000)
+        val jsonBody = JSONObject().apply {
+            put("title", title)
+            put("artist", artist)
+            put("is_playing", isPlaying)
+            put("duration", duration / 1000)
+            put("position", position / 1000)
+        }
 
         val requestBody = jsonBody.toString().toRequestBody(JSON_TYPE)
         
@@ -128,24 +173,26 @@ class MyNotificationListener : NotificationListenerService() {
             .url(url)
             .post(requestBody)
             
-        if (token.isNotEmpty()) {
-            builder.addHeader("Authorization", "Bearer $token")
+        if (settings.token.isNotEmpty()) {
+            builder.addHeader("Authorization", "Bearer ${settings.token}")
         }
         
         val request = builder.build()
 
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                Log.e("YoutubeMusicRPC", "❌ 送信失敗: ${e.message}")
+                Log.e(TAG, "❌ 送信失敗: ${e.message}")
             }
 
             override fun onResponse(call: Call, response: Response) {
-                if (response.isSuccessful) {
-                    Log.d("YoutubeMusicRPC", "✅ 送信成功")
-                } else {
-                    Log.e("YoutubeMusicRPC", "⚠️ サーバーエラー: ${response.code}")
+                response.use {
+                    when {
+                        it.isSuccessful -> Log.d(TAG, "✅ 送信成功")
+                        it.code == 401 -> Log.e(TAG, "⛔ 認証失敗: トークンを確認してください")
+                        it.code == 429 -> Log.w(TAG, "⏳ レート制限中")
+                        else -> Log.e(TAG, "⚠️ サーバーエラー: ${it.code}")
+                    }
                 }
-                response.close()
             }
         })
     }

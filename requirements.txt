@@ -3,3 +3,5 @@ pypresence>=4.0.0
 ytmusicapi>=1.0.0
 python-dotenv>=1.0.0
 waitress>=2.1.2
+flask-limiter>=3.0.0
+flask-cors>=4.0.0

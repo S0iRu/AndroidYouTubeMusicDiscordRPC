@@ -47,4 +47,7 @@ dependencies {
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    
+    // Security - Encrypted SharedPreferences
+    implementation("androidx.security:security-crypto:1.0.0")
 }
