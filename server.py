@@ -9,10 +9,22 @@ import sys
 import io
 import re
 import secrets
+import logging
 
 # Windows文字コード問題対策（UTF-8強制）
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
+# ファイルログ設定
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(message)s',
+    handlers=[
+        logging.FileHandler('server_debug.log', encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
 from flask import Flask, request, jsonify, g
 from flask_limiter import Limiter
@@ -474,9 +486,15 @@ def update_status():
         time_diff = abs(calc_start_time - last_calc_start_time)
         is_seeked = time_diff > 2
         
-        # 重複更新スキップ
-        if (title == last_title and 
-            artist == last_artist and 
+        # 曲が変わったかどうか
+        is_new_song = (title != last_title or artist != last_artist)
+        
+        # デバッグログ
+        if is_new_song:
+            logger.info(f"🆕 新しい曲検出: {last_title} → {title}")
+        
+        # 重複更新スキップ（同じ曲・同じ状態・シークなし・60秒以内）
+        if (not is_new_song and 
             is_playing == last_is_playing and 
             not is_seeked and
             current_time - last_update_time < 60):
@@ -484,12 +502,21 @@ def update_status():
             reset_idle_timer()
             return jsonify({"status": "skipped"}), 200
 
+        # 曲が変わった場合は必ずタイムスタンプをリセット（position=0から開始）
+        if is_new_song:
+            # 新しい曲はposition=0として扱う（Android側から古いpositionが送られることがあるため）
+            last_calc_start_time = current_time
+            logger.info(f"⏱️ タイムスタンプリセット: start={int(last_calc_start_time)} (pos={position}s→0s に強制)")
+        # シークした場合もタイムスタンプを更新
+        elif is_seeked:
+            last_calc_start_time = calc_start_time
+            logger.info(f"⏩ シーク検出: タイムスタンプ更新")
+        
         # 状態更新
         last_title = title
         last_artist = artist
         last_is_playing = is_playing
         last_update_time = current_time
-        last_calc_start_time = calc_start_time
 
         # Discord接続確認
         if not ensure_rpc_connection():
@@ -498,12 +525,13 @@ def update_status():
         # 画像検索
         image_url, video_id = search_album_art(title, artist)
 
-        # タイムスタンプ計算
+        # タイムスタンプ計算（保存したstart_timeを使用して時間が進むようにする）
         timestamps = {}
+        logger.info(f"📊 is_playing={is_playing}, duration={duration}, last_calc_start_time={int(last_calc_start_time)}")
         if is_playing and duration > 0:
-            start_time = int(current_time - position)
-            end_time = int(start_time + duration)
-            timestamps = {'start': start_time, 'end': end_time}
+            # 保存されたstart_timeを使用（曲変更/シーク時のみ更新される）
+            timestamps = {'start': int(last_calc_start_time)}
+            logger.info(f"⏰ Discord送信: start={timestamps['start']}")
 
         # ボタン設定
         buttons = None
@@ -527,7 +555,6 @@ def update_status():
                 
                 if timestamps:
                     update_args['start'] = timestamps.get('start')
-                    update_args['end'] = timestamps.get('end')
                 
                 if buttons:
                     update_args['buttons'] = buttons
