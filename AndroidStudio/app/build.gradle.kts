@@ -1,12 +1,11 @@
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
 }
 
 android {
     namespace = "com.example.youtubemusicrpc"
     compileSdk {
-        version = release(36)
+        version = release(37)
     }
 
     defaultConfig {
@@ -49,7 +48,7 @@ dependencies {
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
-    implementation("com.squareup.okhttp3:okhttp:4.12.1")
+    implementation("com.squareup.okhttp3:okhttp:5.5.1")
     
     // Security - Encrypted SharedPreferences
     implementation("androidx.security:security-crypto:1.1.0")
