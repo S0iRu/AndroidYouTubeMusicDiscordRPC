@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    name: Android アプリのビルド
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: AndroidStudio
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      # gradlew に実行権限が付いていないので bash 経由で呼ぶ
+      - name: デバッグビルド
+        run: bash ./gradlew assembleDebug
+
+  server:
+    name: サーバーのインストール・構文チェック
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.15'
+
+      - name: 依存関係のインストール
+        run: pip install -r requirements.txt
+
+      - name: 構文チェック
+        run: python -m compileall -q .
